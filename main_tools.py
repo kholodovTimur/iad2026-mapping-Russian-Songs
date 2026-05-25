@@ -322,7 +322,7 @@ def test_loop(model, data, project_name, framework = 'llama', max_tokens=512, te
             'max_tokens': max_tokens
         }
         
-        with wandb.init(project=project_name, config=hyperparameters, name = name) as run:
+        with wandb.init(project=project_name, config=hyperparameters, name = name, notes=notes) as run:
             nan = 0
             for index, data in pbar:
                 try:
