@@ -374,12 +374,16 @@ def test_loop(model, data, project_name, framework = 'llama', max_tokens=512, te
                     
                 })
 
-
                 text_accuracy = len(df[df['FN'] == 0].loc[:index]) / len(df.loc[:index])
                 
                 recall = df['TP'].sum() / (df['TP'].sum() + df['FN'].sum())
                 
                 precision = df['TP'].sum() / (df['TP'].sum() + df['FP'].sum())
+
+                if (recall == 0) & (precision == 0):
+                    f = 0
+                else:
+                    f = 2 * ((precision * recall) / (precision + recall))
 
                 run.log({
                         'text/accuracy': text_accuracy,
