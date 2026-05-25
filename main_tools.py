@@ -386,7 +386,7 @@ def test_loop(model, data, project_name, framework = 'llama', max_tokens=512, te
                 else:
                     precision = 0
                 
-                if (recall == 0) & (precision == 0):
+                if (recall == 0) or (precision == 0):
                     f = 0
                 else:
                     f = 2 * ((precision * recall) / (precision + recall))
