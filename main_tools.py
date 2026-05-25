@@ -378,7 +378,7 @@ def test_loop(model, data, project_name, framework = 'llama', max_tokens=512, te
                 
                 recall = df['TP'].sum() / (df['TP'].sum() + df['FN'].sum())
 
-                if df['TP'].sum() + df['FN'].sum() > 0:
+                if df['TP'].sum() + df['FP'].sum() > 0:
                     precision = df['TP'].sum() / (df['TP'].sum() + df['FP'].sum())
                 else:
                     precision = 0
