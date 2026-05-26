@@ -1,4 +1,3 @@
-# %%
 import gc
 import os
 import logging
@@ -33,7 +32,6 @@ from pydantic import BaseModel, Field
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-device
 
 class Place(BaseModel):
     toponym: str = Field(
@@ -71,7 +69,7 @@ class SongInfo(BaseModel):
                     "найденные в тексте песни. Пустой список — если не найдено."
     )
 
-TEMPLATES = ["""
+TEMPLATES = {'base-rus':"""
 # ── Роль ────────────────────────────────────────────────────────
 Ты — система NER для русскоязычных текстов песен.
 Твоя задача: извлекать конкретные географические объекты,
@@ -160,10 +158,109 @@ TEMPLATES = ["""
 # ── Вход ────────────────────────────────────────────────────────
 Текст песни: {{text}}
 Ответ: формат SongInfo
-"""]
+""", 'base-eng': """
+# ── Role ────────────────────────────────────────────────────────
+You are a NER (Named Entity Recognition) system for Russian-language
+song lyrics.
+Your task: extract specific geographical objects whose locations
+can be realistically identified on a map.
+
+# ── Output ──────────────────────────────────────────────────────
+Respond strictly in JSON format matching the SongInfo schema:
+  {"places": [{"toponym": "...", "type": "..."}]}
+
+# ── Types ───────────────────────────────────────────────────────
+Allowed values for type:
+  "улица"   — street, avenue, lane, highway, boulevard,
+              embankment, square
+  "метро"   — metro/subway station or metro system
+  "район"   — city district, borough, microdistrict,
+              residential area, historical intra-city locality
+              (e.g. Zamoskvorechye, Khamovniki)
+  "город"   — city, town, settlement, village, hamlet
+  "регион"  — federal subject or historical region of smaller
+              scale (e.g. Tatarstan, Kuban, Podmoskovye)
+  "округ"   — federal district or established macro-region
+              (e.g. Ural, Siberia, Far East, Caucasus, Volga Region)
+  "страна"  — state, country, republic
+  "природа" — natural geographic feature: river, mountain, lake,
+              forest, island, nature reserve
+  "другое"  — specific buildings, landmarks, clubs, urban parks
+              (e.g. Gorky Park, TsPKiO), stadiums
+
+# ── Mandatory Rules ─────────────────────────────────────────────
+1. toponym — copy verbatim from the text. Do NOT normalize
+   grammatical case, capitalization, or spelling under any
+   circumstances.
+2. Named objects only. Generic nouns like "street", "river",
+   "city" without a proper name must NOT be included.
+3. Extract multi-word names as a single toponym, never split them:
+      "Nizhny Novgorod"     → one toponym
+      "Saint Petersburg"    → one toponym
+      "North Ossetia"       → one toponym
+      "Gorky Park"          → one toponym
+4. Duplicates: if the same toponym appears multiple times in the
+   exact same form — include it only once. If the form differs
+   due to inflection ("Москва" vs "Москве") — include each
+   form as a separate entry.
+5. Homonymy — always check context before tagging:
+      "Volga" = car model        → do NOT include
+      "Volga" = river            → include, type = "природа"
+      "Ural"  = factory/brand    → do NOT include
+      "Ural"  = macro-region     → include, type = "округ"
+6. Adjectives: include only if they denote a specific place,
+   not a generic attribute:
+      "московский поезд" (Moscow train)  → do NOT include
+      "Я живу на Невском" (I live on Nevsky) → include
+                                             "Невском", type = "улица"
+      "тверская девчонка" (Tver girl)   → do NOT include
+      "иду по Тверской" (walking along Tverskaya) → include
+                                             "Тверской", type = "улица"
+7. The same toponym can be either a street or a metro station.
+   Distinguish by context:
+      "по Тверской", "иду / еду по", "на углу"
+        → type = "улица"  (street)
+      "на Пушкинской", "выхожу на", "станция"
+        → type = "метро"  (metro)
+8. If no toponyms are found — return {"places": []}.
+
+# ── Examples ────────────────────────────────────────────────────
+Text:   "Еду по Тверской, выхожу на Пушкинской"
+Answer: {"places": [
+            {"toponym": "Тверской",   "type": "улица"},
+            {"toponym": "Пушкинской", "type": "метро"}
+        ]}
+
+Text:   "Волга едет по МКАД"
+Answer: {"places": [{"toponym": "МКАД", "type": "улица"}]}
+        // "Волга" = car → skip
+
+Text:   "Волга впадает в Каспийское море"
+Answer: {"places": [
+            {"toponym": "Волга",           "type": "природа"},
+            {"toponym": "Каспийское море", "type": "природа"}
+        ]}
+
+Text:   "Я в Питере снова"
+Answer: {"places": [{"toponym": "Питере", "type": "город"}]}
+        // colloquial form — do not normalize
+
+Text:   "От Урала до Дальнего Востока"
+Answer: {"places": [
+            {"toponym": "Урала",           "type": "округ"},
+            {"toponym": "Дальнего Востока","type": "округ"}
+        ]}
+
+Text:   "Гуляем в Парке Горького"
+Answer: {"places": [{"toponym": "Парке Горького", "type": "другое"}]}
+
+# ── Input ───────────────────────────────────────────────────────
+Song text: {{text}}
+Answer: SongInfo format
+"""}
 
 class BaseLLM:
-    def __init__(self, template = TEMPLATES[0], json_scheme = SongInfo):
+    def __init__(self, template = TEMPLATES['base-rus'], json_scheme = SongInfo):
         self.model = None
         self.tokenizer = None
         self.outlines_model = None
@@ -231,7 +328,7 @@ class LlamaCPP:
                  context_window: int = 4096,
                  n_gpu: int = -1,
                  json_scheme: type[BaseModel] = SongInfo,
-                 template=TEMPLATES[0],
+                 template=TEMPLATES['base-rus'],
                  verbose=False):
 
         gc.collect()
@@ -245,12 +342,12 @@ class LlamaCPP:
         self.template = Template.from_string(template)
         self.json_scheme = json_scheme
 
-    def load(self, model_name: str, model_id: str):
+    def load(self, model_path: str, model_name: str):
         self.model_name = model_name
         self.llm = Llama(
             model_path=hf_hub_download(
-                repo_id= model_name,
-                filename= model_id,
+                repo_id= model_path,
+                filename= model_name,
                 token = os.getenv('HF_T')
             ),
             n_ctx=self.context_window,
@@ -293,8 +390,7 @@ class LlamaCPP:
             torch.cuda.ipc_collect()
 
 def test_loop(model, data, project_name, framework = 'llama', max_tokens=512, temp: float = 0.1,
-              name="test 1",
-              notes=''):
+              name="test 1", notes=''):
     def to_dict(cell):
         if pd.isna(cell) == True:
             return []
@@ -374,19 +470,19 @@ def test_loop(model, data, project_name, framework = 'llama', max_tokens=512, te
                     
                 })
 
-                text_accuracy = len(df[df['FN'] == 0].loc[:index]) / len(df.loc[:index])
+                text_accuracy = len(df[(df['FN'] == 0) & (df['FP'] == 0)].loc[:index]) / len(df.loc[:index])
 
-                if df['TP'].sum() + df['FN'].sum() > 0:
-                    recall = df['TP'].sum() / (df['TP'].sum() + df['FN'].sum())
+                if (truepos_falseneg_sum := df['TP'].sum() + df['FN'].sum()) > 0:
+                    recall = df['TP'].sum() / truepos_falseneg_sum
                 else:
                     recall = 0
 
-                if df['TP'].sum() + df['FP'].sum() > 0:
-                    precision = df['TP'].sum() / (df['TP'].sum() + df['FP'].sum())
+                if (truepos_falsepos_sum := df['TP'].sum() + df['FP'].sum()) > 0:
+                    precision = df['TP'].sum() / truepos_falsepos_sum
                 else:
                     precision = 0
                 
-                if (recall == 0) & (precision == 0):
+                if (recall == 0) or (precision == 0):
                     f = 0
                 else:
                     f = 2 * ((precision * recall) / (precision + recall))
