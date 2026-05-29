@@ -1,1 +1,440 @@
-{"metadata":{"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"},"language_info":{"name":"python","version":"3.12.13","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"nvidiaTeslaT4","dataSources":[{"sourceType":"datasetVersion","sourceId":16507091},{"sourceType":"datasetVersion","sourceId":16513969},{"sourceType":"datasetVersion","sourceId":16463182}],"dockerImageVersionId":31401,"isInternetEnabled":true,"language":"python","sourceType":"script","isGpuEnabled":true}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"# %% [code]\n!pip install huggingface_hub wandb langchain-community langgraph geopy langchain_google_genai --upgrade --quiet --no-cache-dir\n\n!pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --no-cache-dir --quiet\n\n# %% [code]\nfrom langchain_core.language_models.chat_models import BaseChatModel\nfrom langchain_core.messages import AIMessage, HumanMessage, SystemMessage\nfrom langchain_core.outputs import ChatGeneration, ChatResult\nfrom langchain_core.runnables import RunnableLambda\nfrom langchain_google_genai import ChatGoogleGenerativeAI\n\nfrom langgraph.graph import START, END, StateGraph\nfrom geopy.location import Location\nfrom huggingface_hub import hf_hub_download\n\nfrom llama_cpp import Llama\n\nfrom pydantic import BaseModel, Field\nfrom typing import Any, Literal, TypedDict\n\nfrom geopy.geocoders import Nominatim\nfrom geopy.extra.rate_limiter import RateLimiter\n\nimport geopandas as gpd\nimport numpy as np\nimport pandas as pd\nimport wandb\nimport time\nimport json\nimport os\n\nfrom tqdm.auto import tqdm\n\n# %% [code]\n# Структура взята из документации: ссылка!\nfrom pydantic import PrivateAttr\n\nclass LlamaLLM(BaseChatModel):\n    model_path: str\n    llm: Llama\n\n    @property\n    def _llm_type(self) -> str:\n        return \"llama-cpp-python\"\n    \n    def __init__(self, model_path: str, **kwargs: Any):\n        main_kwargs = {k: v for k, v in kwargs.items() if k in {'n_ctx', 'n_batch', 'n_threads', 'verbose', 'use_mmap'}}\n        llm = Llama(model_path=model_path, n_gpu_layers=-1, use_mmap=False, **main_kwargs)\n        super().__init__(model_path=model_path, llm=llm)\n        \n        \n    def _convert_messages(self, messages: list) -> list[dict]:\n        dictionary = {'ai':'assistant', 'human': 'user', 'system':'system'}\n        return [{'role': dictionary[i.type], 'content': i.content} for i in messages]\n        \n\n    def _generate(self, messages: list, **kwargs) -> ChatResult:\n        \n        messages = self._convert_messages(messages)\n        response = self.llm.create_chat_completion(\n            messages=messages, **kwargs\n        )\n        \n        return  ChatResult(generations = [ChatGeneration(message = AIMessage(content = response['choices'][0]['message']['content']))])\n\n    def with_structured_output(self, schema, include_raw: bool = False):\n        \n        def _generate_strucured(messages: list, **kwargs):\n            \n            messages = self._convert_messages(messages)\n\n            try:\n                response = self.llm.create_chat_completion(\n                    messages=messages,\n                    response_format={'type': 'json_object', 'schema': schema.model_json_schema()},\n                    **kwargs\n                )\n            except Exception as e:\n                if include_raw:\n                    return {'raw': None, 'parsed': None, 'gen_error': e, 'error_phase': 'generation'}\n                raise\n            \n            response = response['choices'][0]['message']['content']\n            \n            parsed_response = None\n            try:\n                parsed_response = schema.model_validate_json(response)\n            except Exception as e:\n                if include_raw:\n                    return {'raw': AIMessage(content=response), 'parsed': None, 'error': e, 'error_phase': 'parsing'}\n                raise\n                \n            if include_raw:\n                return {\n                    'raw': AIMessage(content=response),\n                    'parsed': parsed_response,\n                    'error': None,\n                    'error_phase': None\n                }\n\n            return parsed_response\n        \n        return RunnableLambda(_generate_strucured)\n    \nclass Place(BaseModel):\n    toponym: str = Field(\n        description=jsonprompts['ToponymDescr']\n    )\n    normal: str = Field(\n        description=jsonprompts['NormalizDescr']\n    )\n    type: Literal[\n        \"улица\", \"метро\", \"район\",\n        \"город\", \"регион\", \"округ\", \"страна\", \"природа\", \"другое\"\n    ] = Field(\n        description=(\n            jsonprompts['TypeTopDescr']\n        )\n    )\n\nclass SongInfo(BaseModel):\n    places: list[Place] = Field(\n        description=\"Все именованные географические объекты, \"\n                    \"найденные в тексте песни. Пустой список — если не найдено.\"\n    )\n\nclass AddressMatch(BaseModel):\n    match: bool = Field(\n        description=\"True если адрес соответствует топониму в контексте песни\"\n    )\n    confidence: float = Field(\n        ge=0.0, le=1.0,\n        description=\"Уверенность от 0.0 до 1.0\"\n    )\n    \nclass Song(TypedDict):\n    song_text: str\n    toponymns: SongInfo\n    locations: list[Location]\n    confident_topomymns: list[str] = []\n    score: str\n    recognitiontime: float\n    geotime: float\n\n# %% [code]\nclass SongToponymGeoRecognition:\n    \n    def __init__(self, recognition_model_repo_id: str = \"unsloth/Qwen3.6-35B-A3B-GGUF\", recognition_model_name: str = \"Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf\",\n                   geo_model_repo_id: str = \"unsloth/Qwen3.6-35B-A3B-GGUF\", geo_model_name: str = \"Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf\",\n                   recognition_mt: int = 512, recognition_t: float = 0.7, recog_ctx: int = 4096, geo_mt: int = 512, geo_t: float = 0.1, geo_ctx: int = 4096, **kwargs):\n        self.recognition_model_repo_id = recognition_model_repo_id\n        self.recognition_model_name = recognition_model_name\n        self.geo_model_repo_id = geo_model_repo_id\n        self.geo_model_name = geo_model_name\n        self.recognition_mt = recognition_mt\n        self.recognition_t = recognition_t\n        self.recog_ctx = recog_ctx\n        self.geo_mt = geo_mt\n        self.geo_t = geo_t\n        self.geo_ctx = geo_ctx\n        self.model = self.graph_instance(**kwargs)\n    \n    def get_model(self, model_repo_id: str, model_name: str, mt: int, t: float, ctx: int, **kwargs):\n        \n        if 'gemini' in model_name.lower():\n            \n            if not os.environ.get('GOOGLE_API_KEY', '').strip():\n                os.environ['GOOGLE_API_KEY'] = input('Input your Google API key: ')\n            \n            using_model = ChatGoogleGenerativeAI(model=model_name,\n                                                temperature=t,\n                                                max_tokens=mt,\n                                                max_retries=2,\n                                                **kwargs)\n        else:\n            if not os.environ.get('HF_TOKEN', '').strip():\n                os.environ['HF_TOKEN'] = input('Input your HuggingFace API key: ')\n                \n            model_path = hf_hub_download(\n                    repo_id=model_repo_id,\n                    filename=model_name\n                )\n            \n            using_model = LlamaLLM(model_path=model_path,\n                n_ctx=ctx, **kwargs)\n    \n        return using_model\n    \n    def get_toponymns(self, model, state: Song):\n        st_t = time.time()\n        \n        prompt = jsonprompts['MainToponymPrompt']\n            \n        coder = model.with_structured_output(SongInfo)\n        state['toponymns'] = coder.invoke([SystemMessage('Отвечай без размышлений. /no_think'),\n                                    HumanMessage(f'{prompt}\\nВот текст песни: {state['song_text']}')])  \n        f_t = time.time()\n        full_t = f_t-st_t\n        print(f'Распознавание топонимов заняло {full_t}')\n        state['recognitiontime'] = full_t\n        return state\n\n    def get_context(self, song_text: str, toponym: str):\n        try:\n            idx = song_text.find(toponym)\n            if idx == -1:\n                return song_text\n    \n            if '\\n' in song_text and len(song_text.split('\\n')) > 10:\n                lines = song_text.split('\\n')\n\n                char_count = 0\n                target_line = 0\n                for i, line in enumerate(lines):\n                    if (char_count + len(line)) >= idx:\n                        target_line = i\n                        break\n                    char_count += len(line) - 1\n    \n                start = max(0, target_line - 5)\n                end = min(len(lines), target_line + 6)\n                return '\\n'.join(lines[start:end])\n    \n            else:\n                start = max(0, idx - 150)\n                end = min(len(song_text), idx + len(toponym) + 150)\n                return song_text[start:end]\n    \n        except Exception:\n            return song_text\n    \n    def get_geo(self, model, state: Song):\n        geolocator = Nominatim(user_agent=\"iad_project\")\n        geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)\n        locations = []\n        confident_topomymns = []\n        st_t = time.time()\n        for toponym in [i for i in state['toponymns'].model_dump()['places']]:\n            toponym_loc = geocode(toponym['normal'], geometry = 'geojson', exactly_one = True)\n\n            if toponym_loc != None:\n\n                coder = model.with_structured_output(AddressMatch)\n        \n        \n                prompt = jsonprompts['MainGeoPrompt']\n\n                context = self.get_context(state['song_text'], toponym['toponym'])\n                \n                ans = coder.invoke([SystemMessage('Отвечай без размышлений. /no_think'),\n                            HumanMessage(prompt.format(context=context,\n                                                        toponym=toponym['normal'],\n                                                        address=toponym_loc.address))], max_tokens=self.geo_mt, temperature=self.geo_t)  # Здесь температура и максимальный размер токенов в случае если они отличаются от их размера для геокодирования\n                if ans.match == True:\n                    locations.append(toponym_loc)\n                    confident_topomymns.append(toponym['toponym'])\n            else:\n                continue\n            f_t = time.time()\n            full_t = f_t-st_t\n        print(f'Распознование гео заняло: {full_t}')\n            \n        state['locations'] = locations\n        state['confident_topomymns'] = confident_topomymns\n        state['geotime'] = full_t\n        return state\n\n    def should_continue(self, state):\n        finded = len(state['toponymns'].places)\n        if finded == 0:\n            state['confident_topomymns'] = []\n            return END\n        else:\n            return 'get_geo'\n\n    def graph_instance(self, **kwargs):\n\n        if (self.recognition_model_repo_id == self.geo_model_repo_id) and (self.recognition_model_name == self.geo_model_name):\n            equal_model = self.get_model(self.recognition_model_repo_id, self.recognition_model_name, self.recognition_mt, self.recognition_t, self.recog_ctx, **kwargs)\n\n            recog_model = equal_model\n            geo_model = equal_model\n        else:\n            recog_model = self.get_model(self.recognition_model_repo_id, self.recognition_model_name, self.recognition_mt, self.recognition_t, self.recog_ctx, **kwargs)\n            geo_model = self.get_model(self.geo_model_repo_id, self.geo_model_name, self.geo_mt, self.geo_t, self.geo_ctx, **kwargs)\n\n        graph_builder = StateGraph(Song)\n\n        graph_builder.add_node(\"get_toponyms\", lambda state: self.get_toponymns(recog_model, state))\n        graph_builder.add_node(\"get_geo\", lambda state: self.get_geo(geo_model, state))\n\n        graph_builder.add_edge(START, \"get_toponyms\")\n\n        graph_builder.add_conditional_edges(\n            \"get_toponyms\",\n            self.should_continue,\n            ['get_geo', END])\n\n        graph_builder.add_edge(\"get_geo\", END)\n\n        graph = graph_builder.compile()\n\n        return graph\n    \n    def proceed_one_track(self, song: str):\n        \"\"\"\n        Позволяет обработать один текст песни при помощи инициализированной модели.\n        \"\"\"\n        return self.model.invoke({'song_text': song})\n        \n    def proceed_data(self, data, run_name, project_name = 'iadProject', notes=''):\n        \"\"\"\n        Позволяет обработать датасет из песен при помощи инициализированной модели.\n        \"\"\"\n\n        def to_dict(cell):\n            if pd.isna(cell) == True:\n                return []\n            else:\n                cell = cell.split(', ')\n                cell = [{'toponym': i.split(':')[0], 'type': i.split(':')[:-1]} for i in cell]\n                return cell\n\n        df = data.copy()\n                \n        df['Топонимы'] = df['Топонимы'].apply(lambda x: to_dict(x))\n                \n        for col in ['predicted', 'true_toponyms', 'true_types', 'predicted_toponyms', 'predicted_types', 'true_predicted', 'unpredicted', 'overpredicted', 'TP', 'FP', 'FN']:\n            df[col] = None\n            df[col] = df[col].astype(object)\n\n        with tqdm(df.iterrows(), total = len(df)) as pbar:\n\n            hyperparameters = {\n                'model': run_name or self.recognition_model_name,\n                'temp_recog': self.recognition_t,\n                'temp_geo': self.geo_t,\n                'prompt': '-',\n                'context_window_recog': self.recog_ctx,\n                'context_window_geo': self.geo_ctx,\n                'max_tokens_recog': self.recognition_mt,\n                'max_tokens_geo': self.geo_mt\n            }\n            \n            with wandb.init(project=project_name, config=hyperparameters, name = run_name or self.recognition_model_name, notes=notes) as run:\n                nan = 0\n                recog_time = 0\n                geo_time = 0\n                for index, data in pbar:\n                    try:\n                        run.define_metric(\"technical/total_time\", summary=\"mean\")\n                        run.define_metric(\"technical/recognition_time\", summary=\"mean\")\n                        run.define_metric(\"technical/geo_time\", summary=\"mean\")\n                        start = time.time()\n                        \n                        p = self.model.invoke({'song_text': data['lyrics']})\n                        \n                        if len(p['toponymns'].places) == 0:\n                            p = []\n                            recog_time = nan\n                            geo_time = nan\n                        else:\n                            recog_time = p['recognitiontime']\n                            geo_time = p['geotime']\n                            p = p['confident_topomymns']\n                            \n                            \n                        df.at[index, 'predicted'] = p\n                            \n                        total_time = time.time() - start\n                        \n                        df.at[index, 'true_toponyms'] = [i['toponym'] for i in data['Топонимы']]\n                        df.at[index, 'predicted_toponyms'] = df.at[index, 'predicted']\n                        \n                        df.at[index, 'true_predicted'] = set(df.loc[index, 'true_toponyms']) & set(df.loc[index, 'predicted_toponyms'])\n                        print(f'Верные топонимы: {set(df.loc[index, 'true_toponyms'])}, Предсказанные: {set(df.loc[index, 'predicted_toponyms'])}')\n                        df.at[index, 'unpredicted'] = set(df.loc[index, 'true_toponyms']) - set(df.loc[index, 'predicted_toponyms'])\n                        df.at[index, 'overpredicted'] = set(df.loc[index, 'predicted_toponyms']) - set(df.loc[index, 'true_toponyms'])\n                        \n                        df.at[index, 'TP'] = len(df.at[index, 'true_predicted'])\n                        df.at[index, 'FN'] = len(df.at[index, 'unpredicted'])\n                        df.at[index, 'FP'] = len(df.at[index, 'overpredicted'])\n\n                    except Exception as e:\n                        total_time = time.time() - start\n                        \n                        df.at[index, 'predicted'] = np.nan\n                        df.at[index, 'true_toponyms'] = np.nan\n                        df.at[index, 'true_types'] = np.nan\n                        df.at[index, 'predicted_toponyms'] = np.nan\n                        df.at[index, 'predicted_types'] = np.nan\n                        df.at[index, 'true_predicted'] = np.nan\n                        df.at[index, 'unpredicted'] = np.nan\n                        df.at[index, 'overpredicted'] = np.nan\n                        \n                        df.at[index, 'TP'] = np.nan\n                        df.at[index, 'FP'] = np.nan\n                        df.at[index, 'FN'] = np.nan\n\n                        nan+=1\n                        tqdm.write(f\"Error: {e}\")\n\n                    pbar.set_postfix({\n                        'TP': df.at[index, 'TP'],\n                        'FN': df.at[index, 'FN'],\n                        'FP': df.at[index, 'FP']\n                        \n                    })\n\n                    text_accuracy = len(df[(df['FN'] == 0) & (df['FP'] == 0)].loc[:index]) / len(df.loc[:index])\n\n                    if (truepos_falseneg_sum := (df['TP'].sum() + df['FN'].sum())) > 0:\n                        recall = df['TP'].sum() / truepos_falseneg_sum\n                    else:\n                        recall = 0\n\n                    if (truepos_falsepos_sum := (df['TP'].sum() + df['FP'].sum())) > 0:\n                        precision = df['TP'].sum() / truepos_falsepos_sum\n                    else:\n                        precision = 0\n                    \n                    if (recall == 0) or (precision == 0):\n                        f = 0\n                    else:\n                        f = 2 * ((precision * recall) / (precision + recall))\n\n                    run.log({\n                            'text/accuracy': text_accuracy,\n                            'toponyms/recall': recall,\n                            'toponyms/precision': precision,\n                            'toponyms/f': f,\n                            'technical/error_rate': nan,\n                            'technical/total_time': total_time,\n                            'technical/recognition_time': recog_time,\n                            'technical/geo_time': geo_time\n                    })\n\n                \n                artifact = wandb.Artifact(\"words\", type=\"dataset\")\n                words = wandb.Table(dataframe = df[['unpredicted','overpredicted']])\n                artifact.add(words, \"unpredicted_overpredicted\")\n                wandb.log_artifact(artifact)\n                \n                \n\n        return df\n\n","metadata":{"_uuid":"8c5fee8d-f226-46d4-acba-3411945a8940","_cell_guid":"5d9d6fd1-ab81-4082-ac27-556b134faab5","trusted":true,"collapsed":false,"jupyter":{"outputs_hidden":false}},"outputs":[],"execution_count":null}]}
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import RunnableLambda
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+from langgraph.graph import START, END, StateGraph
+from geopy.location import Location
+from huggingface_hub import hf_hub_download
+
+from llama_cpp import Llama
+
+from pydantic import BaseModel, Field
+from typing import Any, Literal, TypedDict
+
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import wandb
+import time
+import json
+import os
+
+from tqdm.auto import tqdm
+
+# Структура взята из документации: ссылка!
+from pydantic import PrivateAttr
+
+class LlamaLLM(BaseChatModel):
+    model_path: str
+    llm: Llama
+
+    @property
+    def _llm_type(self) -> str:
+        return "llama-cpp-python"
+    
+    def __init__(self, model_path: str, **kwargs: Any):
+        main_kwargs = {k: v for k, v in kwargs.items() if k in {'n_ctx', 'n_batch', 'n_threads', 'verbose', 'use_mmap'}}
+        llm = Llama(model_path=model_path, n_gpu_layers=-1, use_mmap=False, **main_kwargs)
+        super().__init__(model_path=model_path, llm=llm)
+        
+        
+    def _convert_messages(self, messages: list) -> list[dict]:
+        dictionary = {'ai':'assistant', 'human': 'user', 'system':'system'}
+        return [{'role': dictionary[i.type], 'content': i.content} for i in messages]
+        
+
+    def _generate(self, messages: list, **kwargs) -> ChatResult:
+        
+        messages = self._convert_messages(messages)
+        response = self.llm.create_chat_completion(
+            messages=messages, **kwargs
+        )
+        
+        return  ChatResult(generations = [ChatGeneration(message = AIMessage(content = response['choices'][0]['message']['content']))])
+
+    def with_structured_output(self, schema, include_raw: bool = False):
+        
+        def _generate_strucured(messages: list, **kwargs):
+            
+            messages = self._convert_messages(messages)
+
+            try:
+                response = self.llm.create_chat_completion(
+                    messages=messages,
+                    response_format={'type': 'json_object', 'schema': schema.model_json_schema()},
+                    **kwargs
+                )
+            except Exception as e:
+                if include_raw:
+                    return {'raw': None, 'parsed': None, 'gen_error': e, 'error_phase': 'generation'}
+                raise
+            
+            response = response['choices'][0]['message']['content']
+            
+            parsed_response = None
+            try:
+                parsed_response = schema.model_validate_json(response)
+            except Exception as e:
+                if include_raw:
+                    return {'raw': AIMessage(content=response), 'parsed': None, 'error': e, 'error_phase': 'parsing'}
+                raise
+                
+            if include_raw:
+                return {
+                    'raw': AIMessage(content=response),
+                    'parsed': parsed_response,
+                    'error': None,
+                    'error_phase': None
+                }
+
+            return parsed_response
+        
+        return RunnableLambda(_generate_strucured)
+    
+class Place(BaseModel):
+    toponym: str = Field(
+        description=jsonprompts['ToponymDescr']
+    )
+    normal: str = Field(
+        description=jsonprompts['NormalizDescr']
+    )
+    type: Literal[
+        "улица", "метро", "район",
+        "город", "регион", "округ", "страна", "природа", "другое"
+    ] = Field(
+        description=(
+            jsonprompts['TypeTopDescr']
+        )
+    )
+
+class SongInfo(BaseModel):
+    places: list[Place] = Field(
+        description="Все именованные географические объекты, "
+                    "найденные в тексте песни. Пустой список — если не найдено."
+    )
+
+class AddressMatch(BaseModel):
+    match: bool = Field(
+        description="True если адрес соответствует топониму в контексте песни"
+    )
+    confidence: float = Field(
+        ge=0.0, le=1.0,
+        description="Уверенность от 0.0 до 1.0"
+    )
+    
+class Song(TypedDict):
+    song_text: str
+    toponymns: SongInfo
+    locations: list[Location]
+    confident_topomymns: list[str] = []
+    score: str
+    recognitiontime: float
+    geotime: float
+
+class SongToponymGeoRecognition:
+    
+    def __init__(self, recognition_model_repo_id: str = "unsloth/Qwen3.6-35B-A3B-GGUF", recognition_model_name: str = "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+                   geo_model_repo_id: str = "unsloth/Qwen3.6-35B-A3B-GGUF", geo_model_name: str = "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+                   recognition_mt: int = 512, recognition_t: float = 0.7, recog_ctx: int = 4096, geo_mt: int = 512, geo_t: float = 0.1, geo_ctx: int = 4096, **kwargs):
+        self.recognition_model_repo_id = recognition_model_repo_id
+        self.recognition_model_name = recognition_model_name
+        self.geo_model_repo_id = geo_model_repo_id
+        self.geo_model_name = geo_model_name
+        self.recognition_mt = recognition_mt
+        self.recognition_t = recognition_t
+        self.recog_ctx = recog_ctx
+        self.geo_mt = geo_mt
+        self.geo_t = geo_t
+        self.geo_ctx = geo_ctx
+        self.model = self.graph_instance(**kwargs)
+    
+    def get_model(self, model_repo_id: str, model_name: str, mt: int, t: float, ctx: int, **kwargs):
+        
+        if 'gemini' in model_name.lower():
+            
+            if not os.environ.get('GOOGLE_API_KEY', '').strip():
+                os.environ['GOOGLE_API_KEY'] = input('Input your Google API key: ')
+            
+            using_model = ChatGoogleGenerativeAI(model=model_name,
+                                                temperature=t,
+                                                max_tokens=mt,
+                                                max_retries=2,
+                                                **kwargs)
+        else:
+            if not os.environ.get('HF_TOKEN', '').strip():
+                os.environ['HF_TOKEN'] = input('Input your HuggingFace API key: ')
+                
+            model_path = hf_hub_download(
+                    repo_id=model_repo_id,
+                    filename=model_name
+                )
+            
+            using_model = LlamaLLM(model_path=model_path,
+                n_ctx=ctx, **kwargs)
+    
+        return using_model
+    
+    def get_toponymns(self, model, state: Song):
+        st_t = time.time()
+        
+        prompt = jsonprompts['MainToponymPrompt']
+            
+        coder = model.with_structured_output(SongInfo)
+        state['toponymns'] = coder.invoke([SystemMessage('Отвечай без размышлений. /no_think'),
+                                    HumanMessage(f'{prompt}\nВот текст песни: {state['song_text']}')])  
+        f_t = time.time()
+        full_t = f_t-st_t
+        print(f'Распознавание топонимов заняло {full_t}')
+        state['recognitiontime'] = full_t
+        return state
+
+    def get_context(self, song_text: str, toponym: str):
+        try:
+            idx = song_text.find(toponym)
+            if idx == -1:
+                return song_text
+    
+            if '\n' in song_text and len(song_text.split('\n')) > 10:
+                lines = song_text.split('\n')
+
+                char_count = 0
+                target_line = 0
+                for i, line in enumerate(lines):
+                    if (char_count + len(line)) >= idx:
+                        target_line = i
+                        break
+                    char_count += len(line) - 1
+    
+                start = max(0, target_line - 5)
+                end = min(len(lines), target_line + 6)
+                return '\n'.join(lines[start:end])
+    
+            else:
+                start = max(0, idx - 150)
+                end = min(len(song_text), idx + len(toponym) + 150)
+                return song_text[start:end]
+    
+        except Exception:
+            return song_text
+    
+    def get_geo(self, model, state: Song):
+        geolocator = Nominatim(user_agent="iad_project")
+        geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+        locations = []
+        confident_topomymns = []
+        st_t = time.time()
+        for toponym in [i for i in state['toponymns'].model_dump()['places']]:
+            toponym_loc = geocode(toponym['normal'], geometry = 'geojson', exactly_one = True)
+
+            if toponym_loc != None:
+
+                coder = model.with_structured_output(AddressMatch)
+        
+        
+                prompt = jsonprompts['MainGeoPrompt']
+
+                context = self.get_context(state['song_text'], toponym['toponym'])
+                
+                ans = coder.invoke([SystemMessage('Отвечай без размышлений. /no_think'),
+                            HumanMessage(prompt.format(context=context,
+                                                        toponym=toponym['normal'],
+                                                        address=toponym_loc.address))], max_tokens=self.geo_mt, temperature=self.geo_t)  # Здесь температура и максимальный размер токенов в случае если они отличаются от их размера для геокодирования
+                if ans.match == True:
+                    locations.append(toponym_loc)
+                    confident_topomymns.append(toponym['toponym'])
+            else:
+                continue
+            f_t = time.time()
+            full_t = f_t-st_t
+        print(f'Распознование гео заняло: {full_t}')
+            
+        state['locations'] = locations
+        state['confident_topomymns'] = confident_topomymns
+        state['geotime'] = full_t
+        return state
+
+    def should_continue(self, state):
+        finded = len(state['toponymns'].places)
+        if finded == 0:
+            state['confident_topomymns'] = []
+            return END
+        else:
+            return 'get_geo'
+
+    def graph_instance(self, **kwargs):
+
+        if (self.recognition_model_repo_id == self.geo_model_repo_id) and (self.recognition_model_name == self.geo_model_name):
+            equal_model = self.get_model(self.recognition_model_repo_id, self.recognition_model_name, self.recognition_mt, self.recognition_t, self.recog_ctx, **kwargs)
+
+            recog_model = equal_model
+            geo_model = equal_model
+        else:
+            recog_model = self.get_model(self.recognition_model_repo_id, self.recognition_model_name, self.recognition_mt, self.recognition_t, self.recog_ctx, **kwargs)
+            geo_model = self.get_model(self.geo_model_repo_id, self.geo_model_name, self.geo_mt, self.geo_t, self.geo_ctx, **kwargs)
+
+        graph_builder = StateGraph(Song)
+
+        graph_builder.add_node("get_toponyms", lambda state: self.get_toponymns(recog_model, state))
+        graph_builder.add_node("get_geo", lambda state: self.get_geo(geo_model, state))
+
+        graph_builder.add_edge(START, "get_toponyms")
+
+        graph_builder.add_conditional_edges(
+            "get_toponyms",
+            self.should_continue,
+            ['get_geo', END])
+
+        graph_builder.add_edge("get_geo", END)
+
+        graph = graph_builder.compile()
+
+        return graph
+    
+    def proceed_one_track(self, song: str):
+        """
+        Позволяет обработать один текст песни при помощи инициализированной модели.
+        """
+        return self.model.invoke({'song_text': song})
+        
+    def proceed_data(self, data, run_name, project_name = 'iadProject', notes=''):
+        """
+        Позволяет обработать датасет из песен при помощи инициализированной модели.
+        """
+
+        def to_dict(cell):
+            if pd.isna(cell) == True:
+                return []
+            else:
+                cell = cell.split(', ')
+                cell = [{'toponym': i.split(':')[0], 'type': i.split(':')[:-1]} for i in cell]
+                return cell
+
+        df = data.copy()
+                
+        df['Топонимы'] = df['Топонимы'].apply(lambda x: to_dict(x))
+                
+        for col in ['predicted', 'true_toponyms', 'true_types', 'predicted_toponyms', 'predicted_types', 'true_predicted', 'unpredicted', 'overpredicted', 'TP', 'FP', 'FN']:
+            df[col] = None
+            df[col] = df[col].astype(object)
+
+        with tqdm(df.iterrows(), total = len(df)) as pbar:
+
+            hyperparameters = {
+                'model': run_name or self.recognition_model_name,
+                'temp_recog': self.recognition_t,
+                'temp_geo': self.geo_t,
+                'prompt': '-',
+                'context_window_recog': self.recog_ctx,
+                'context_window_geo': self.geo_ctx,
+                'max_tokens_recog': self.recognition_mt,
+                'max_tokens_geo': self.geo_mt
+            }
+            
+            with wandb.init(project=project_name, config=hyperparameters, name = run_name or self.recognition_model_name, notes=notes) as run:
+                nan = 0
+                recog_time = 0
+                geo_time = 0
+                for index, data in pbar:
+                    try:
+                        run.define_metric("technical/total_time", summary="mean")
+                        run.define_metric("technical/recognition_time", summary="mean")
+                        run.define_metric("technical/geo_time", summary="mean")
+                        start = time.time()
+                        
+                        p = self.model.invoke({'song_text': data['lyrics']})
+                        
+                        if len(p['toponymns'].places) == 0:
+                            p = []
+                            recog_time = nan
+                            geo_time = nan
+                        else:
+                            recog_time = p['recognitiontime']
+                            geo_time = p['geotime']
+                            p = p['confident_topomymns']
+                            
+                            
+                        df.at[index, 'predicted'] = p
+                            
+                        total_time = time.time() - start
+                        
+                        df.at[index, 'true_toponyms'] = [i['toponym'] for i in data['Топонимы']]
+                        df.at[index, 'predicted_toponyms'] = df.at[index, 'predicted']
+                        
+                        df.at[index, 'true_predicted'] = set(df.loc[index, 'true_toponyms']) & set(df.loc[index, 'predicted_toponyms'])
+                        print(f'Верные топонимы: {set(df.loc[index, 'true_toponyms'])}, Предсказанные: {set(df.loc[index, 'predicted_toponyms'])}')
+                        df.at[index, 'unpredicted'] = set(df.loc[index, 'true_toponyms']) - set(df.loc[index, 'predicted_toponyms'])
+                        df.at[index, 'overpredicted'] = set(df.loc[index, 'predicted_toponyms']) - set(df.loc[index, 'true_toponyms'])
+                        
+                        df.at[index, 'TP'] = len(df.at[index, 'true_predicted'])
+                        df.at[index, 'FN'] = len(df.at[index, 'unpredicted'])
+                        df.at[index, 'FP'] = len(df.at[index, 'overpredicted'])
+
+                    except Exception as e:
+                        total_time = time.time() - start
+                        
+                        df.at[index, 'predicted'] = np.nan
+                        df.at[index, 'true_toponyms'] = np.nan
+                        df.at[index, 'true_types'] = np.nan
+                        df.at[index, 'predicted_toponyms'] = np.nan
+                        df.at[index, 'predicted_types'] = np.nan
+                        df.at[index, 'true_predicted'] = np.nan
+                        df.at[index, 'unpredicted'] = np.nan
+                        df.at[index, 'overpredicted'] = np.nan
+                        
+                        df.at[index, 'TP'] = np.nan
+                        df.at[index, 'FP'] = np.nan
+                        df.at[index, 'FN'] = np.nan
+
+                        nan+=1
+                        tqdm.write(f"Error: {e}")
+
+                    pbar.set_postfix({
+                        'TP': df.at[index, 'TP'],
+                        'FN': df.at[index, 'FN'],
+                        'FP': df.at[index, 'FP']
+                        
+                    })
+
+                    text_accuracy = len(df[(df['FN'] == 0) & (df['FP'] == 0)].loc[:index]) / len(df.loc[:index])
+
+                    if (truepos_falseneg_sum := (df['TP'].sum() + df['FN'].sum())) > 0:
+                        recall = df['TP'].sum() / truepos_falseneg_sum
+                    else:
+                        recall = 0
+
+                    if (truepos_falsepos_sum := (df['TP'].sum() + df['FP'].sum())) > 0:
+                        precision = df['TP'].sum() / truepos_falsepos_sum
+                    else:
+                        precision = 0
+                    
+                    if (recall == 0) or (precision == 0):
+                        f = 0
+                    else:
+                        f = 2 * ((precision * recall) / (precision + recall))
+
+                    run.log({
+                            'text/accuracy': text_accuracy,
+                            'toponyms/recall': recall,
+                            'toponyms/precision': precision,
+                            'toponyms/f': f,
+                            'technical/error_rate': nan,
+                            'technical/total_time': total_time,
+                            'technical/recognition_time': recog_time,
+                            'technical/geo_time': geo_time
+                    })
+
+                
+                artifact = wandb.Artifact("words", type="dataset")
+                words = wandb.Table(dataframe = df[['unpredicted','overpredicted']])
+                artifact.add(words, "unpredicted_overpredicted")
+                wandb.log_artifact(artifact)
+                
+                
+
+        return df
+
